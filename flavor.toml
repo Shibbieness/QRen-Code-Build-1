@@ -1,0 +1,6 @@
+[flavor]
+name = "qren-coder"
+version = "1.0.0-phase1"
+license = "AGPL-3.0-or-later"
+entrypoint = "vanilla_flavor:run"
+capabilities = ["encode", "decode", "verify", "block-types", "self-test"]

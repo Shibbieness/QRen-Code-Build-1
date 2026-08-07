@@ -1,0 +1,16 @@
+name: CI
+
+on: [push, pull_request]
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: QRCF format suite
+        run: python test_phase1.py
+      - name: Vanilla Core flavor adapter suite
+        run: python -m unittest test_flavor -v
