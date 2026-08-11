@@ -186,7 +186,13 @@ class QRenEncoder:
             block_type = auto_detect_block_type(raw_bytes, filename_hint)
         
         # ── 3. Determine compression ──
-        comp = compression or self.default_compression
+        # `is not None`, never `or`: CompressionTier.T0_NONE is 0x00 and
+        # therefore FALSY, so `compression or default` silently discarded
+        # an explicit request for no compression and used the default
+        # instead. Asking for T0_NONE had never worked, on the path every
+        # block takes. An enum whose first member is zero cannot be tested
+        # for presence by truthiness.
+        comp = compression if compression is not None else self.default_compression
         
         # ── 4. Determine normalization ──
         norm = BLOCK_NORMALIZATION.get(block_type, NormalizationProfile.LOOSE)

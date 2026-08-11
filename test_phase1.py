@@ -581,6 +581,30 @@ def test_growth_space_still_stops_cleanly(r):
         assert decoded['validation_errors'] == []
         assert decoded['data'] is not None
 
+
+def test_a_zero_valued_enum_is_selectable(r):
+    """REGRESSION. CompressionTier.T0_NONE is 0x00 and therefore FALSY, and
+    the encoder chose with `compression or self.default_compression` — so an
+    explicit request for no compression was silently discarded and the default
+    used instead. Asking for T0_NONE had never worked, on the path every
+    single block takes.
+
+    An enum whose first member is zero cannot be tested for presence by
+    truthiness."""
+    encoder = QRenEncoder()
+    decoder = QRenDecoder()
+    with tempfile.TemporaryDirectory() as tmpdir:
+        outpath = os.path.join(tmpdir, "zero.qren.png")
+        result = encoder.encode(data={"k": 1}, name="zero",
+                                compression=CompressionTier.T0_NONE,
+                                output_path=outpath)
+        assert result['compression'] == CompressionTier.T0_NONE.name, (
+            f"asked for T0_NONE, got {result['compression']} — a falsy enum "
+            f"member was treated as absent")
+        decoded = decoder.decode(outpath)
+        assert decoded['valid'], decoded['validation_errors']
+        assert decoded['data'] == b'{"k": 1}', "uncompressed payload did not survive"
+
 # ═══════════════════════════════════════════════════════════════
 # RUNNER
 # ═══════════════════════════════════════════════════════════════
@@ -595,6 +619,7 @@ def main():
         ("Binary Round-Trip", test_bytes_roundtrip),
         ("XQMEM Standalone Round-Trip", test_xqmem_roundtrip),
         ("All Wire Block Types", test_all_block_types),
+        ("Zero-Valued Enum Is Selectable", test_a_zero_valued_enum_is_selectable),
         ("Normalization Profile Coverage", test_every_block_type_has_a_normalization_profile),
         ("Runic Tag Round-Trip", test_runic_tags),
         ("Integrity Verification", test_integrity_verification),
