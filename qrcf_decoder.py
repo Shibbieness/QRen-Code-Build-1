@@ -242,16 +242,22 @@ class QRenDecoder:
             elif sec.circle_id >= 3:
                 # Circle 3+: Data blocks
                 try:
-                    blocks = self._extract_data_blocks(sec_data)
+                    blocks, block_errors = self._extract_data_blocks(sec_data)
                     data_blocks.extend(blocks)
+                    # Errors from extraction must reach validation_errors, or
+                    # `valid` is computed from a path that never learns blocks
+                    # were dropped — which is exactly how an archive with an
+                    # unknown block type reported valid: True, blocks: 0.
+                    validation_errors.extend(block_errors)
                 except Exception as e:
                     validation_errors.append(f"Circle {sec.circle_id} decode failed: {e}")
         
         # ══ PROFILE C: Block semantics, extract primary data ══
         
         primary_data = None
-        if data_blocks:
-            primary_data = data_blocks[0]['data']
+        decoded = [b for b in data_blocks if b.get('decoded', True)]
+        if decoded:
+            primary_data = decoded[0]['data']
         
         return {
             'profile_a': profile_a,
@@ -263,7 +269,8 @@ class QRenDecoder:
                 'normalization': b['normalization'],
                 'compression': b['compression'],
                 'runic_tags': b['runic_tags'],
-                'data_length': len(b['data']),
+                'data_length': len(b['data']) if b.get('data') is not None else 0,
+                'decoded': b.get('decoded', True),
             } for b in data_blocks],
             'data': primary_data,
             'block_count': len(data_blocks),
@@ -273,39 +280,123 @@ class QRenDecoder:
 
     # ─── Block Extraction ─────────────────────────────────────
 
-    def _extract_data_blocks(self, circle_data: bytes) -> List[dict]:
+    def _extract_data_blocks(self, circle_data: bytes):
         """
         Extract data blocks from a Circle 3+ data section.
-        Handles growth space (trailing zeros) gracefully.
+
+        Returns (blocks, errors). The errors half is the fix: this loop used to
+        collapse three different situations into one `break`, and only one of
+        them is a clean stop.
+
+          growth space     trailing zeros — the section is simply over
+          truncated        the archive is damaged
+          unknown type     the archive is FINE and this decoder is older
+
+        The third was the dangerous one. `BlockHeader.unpack` calls
+        `BlockType(byte)`, which raises ValueError on a code it does not know;
+        the old `except (QRenFormatError, ValueError): break` read that as
+        "growth space reached" and returned the blocks collected so far —
+        usually none. Because `valid` is computed from validation_errors on a
+        separate path, the caller was told `valid: True, blocks: 0, data: None`.
+
+        A newer archive decoded as valid and empty. Silent total data loss.
+
+        Two changes. Unknown codes are now reported rather than swallowed, and
+        because the header layout is position-fixed, an unknown TYPE does not
+        prevent reading the block's LENGTH — so the block is preserved as raw
+        bytes and the loop continues to the next one instead of abandoning the
+        rest of the section.
         """
         blocks = []
+        errors = []
         pos = 0
-        
+
+        known_types = {b.value for b in BlockType}
+        known_norms = {n.value for n in NormalizationProfile}
+        known_comps = {c.value for c in CompressionTier}
+
         while pos < len(circle_data):
-            # Check for growth space (all zeros)
             remaining = circle_data[pos:]
+
+            # Growth space: the one clean stop.
             if remaining == b'\x00' * len(remaining):
-                break  # Growth space reached
-            
-            # Need at least a minimum header
-            if len(remaining) < BlockHeader.FIXED_SIZE:
                 break
-            
+
+            if len(remaining) < BlockHeader.FIXED_SIZE:
+                errors.append(
+                    f"truncated block at offset {pos}: {len(remaining)} bytes "
+                    f"remain, a header needs {BlockHeader.FIXED_SIZE}"
+                )
+                break
+
+            # A zero block_id is also growth space, not a block.
+            if remaining[:32] == b'\x00' * 32:
+                break
+
+            # Peek the fixed-position header fields WITHOUT coercing them to
+            # enums, so an unrecognised value is reported as itself rather than
+            # as the end of the section.
+            raw_type = remaining[32]
+            raw_norm = remaining[33]
+            raw_comp = remaining[34]
+            data_length = struct.unpack('>Q', remaining[36:44])[0]
+            tag_len = struct.unpack('>H', remaining[44:46])[0]
+            frame_end = BlockHeader.FIXED_SIZE + tag_len + data_length
+
+            if frame_end > len(remaining):
+                errors.append(
+                    f"truncated block at offset {pos}: header declares "
+                    f"{frame_end} bytes, only {len(remaining)} remain"
+                )
+                break
+
+            unknown = []
+            if raw_type not in known_types:
+                unknown.append(f"block type 0x{raw_type:02X}")
+            if raw_norm not in known_norms:
+                unknown.append(f"normalization 0x{raw_norm:02X}")
+            if raw_comp not in known_comps:
+                unknown.append(f"compression tier 0x{raw_comp:02X}")
+
+            if unknown:
+                # The archive is probably valid and this decoder is older.
+                # Say so, keep the bytes, and carry on to the next block.
+                errors.append(
+                    f"unrecognised {', '.join(unknown)} at offset {pos} — this "
+                    f"archive was likely written by a newer QRen. "
+                    f"{data_length} bytes preserved undecoded."
+                )
+                blocks.append({
+                    'block_id': remaining[:32].hex(),
+                    'block_type': f"UNKNOWN(0x{raw_type:02X})",
+                    'normalization': f"0x{raw_norm:02X}",
+                    'compression': f"0x{raw_comp:02X}",
+                    'runic_tags': [],
+                    'data': None,
+                    'raw': bytes(remaining[BlockHeader.FIXED_SIZE + tag_len:frame_end]),
+                    'decoded': False,
+                })
+                pos += frame_end
+                continue
+
             try:
                 block_header, header_bytes = BlockHeader.unpack(remaining)
-            except (QRenFormatError, ValueError):
-                break  # Malformed or growth space
-            
-            # Extract compressed data
+            except (QRenFormatError, ValueError) as exc:
+                errors.append(f"malformed block header at offset {pos}: {exc}")
+                break
+
             data_start = header_bytes
             data_end = data_start + block_header.data_length
-            
+
             if data_end > len(remaining):
-                break  # Truncated block
-            
+                errors.append(
+                    f"truncated block body at offset {pos}: needs {data_end} "
+                    f"bytes, {len(remaining)} remain"
+                )
+                break
+
             compressed_data = remaining[data_start:data_end]
-            
-            # Decompress
+
             try:
                 raw_data = self.compressor.decompress(
                     compressed_data, block_header.compression
@@ -315,8 +406,7 @@ class QRenDecoder:
                     f"Block {block_header.block_id.hex()[:16]} "
                     f"decompression failed: {e}"
                 )
-            
-            # Verify content address
+
             if self.verify_integrity:
                 computed_id = content_address(raw_data)
                 if computed_id != block_header.block_id:
@@ -325,7 +415,7 @@ class QRenDecoder:
                         f"header says {block_header.block_id.hex()[:16]}..., "
                         f"data hashes to {computed_id.hex()[:16]}..."
                     )
-            
+
             blocks.append({
                 'block_id': block_header.block_id.hex(),
                 'block_type': block_header.block_type.name,
@@ -333,11 +423,12 @@ class QRenDecoder:
                 'compression': block_header.compression.name,
                 'runic_tags': block_header.runic_tags,
                 'data': raw_data,
+                'decoded': True,
             })
-            
-            pos += header_bytes + block_header.data_length
-        
-        return blocks
+
+            pos += data_end
+
+        return blocks, errors
 
     # ─── Trailer Location ─────────────────────────────────────
 

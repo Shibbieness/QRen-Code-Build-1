@@ -470,6 +470,92 @@ def test_empty_data(r):
         assert decoded['data'] == b""
 
 
+
+def test_unknown_block_type_is_not_silent(r):
+    """REGRESSION. An archive carrying a block type this decoder does not know
+    must report valid=False and preserve the bytes.
+
+    Before the fix this was total silent data loss reported as success:
+    BlockHeader.unpack calls BlockType(byte), which raises ValueError on an
+    unknown code; _extract_data_blocks caught that as "growth space reached"
+    and stopped; and `valid` was computed from validation_errors on a separate
+    path that never learned blocks had been dropped. A newer archive decoded
+    as `valid: True, blocks: 0, data: None`.
+
+    The block frame is located by its block_id — the content address of the
+    payload, which is unique in the archive — rather than by scanning for a
+    matching type byte. An earlier draft of this test scanned, hit an
+    unrelated 0x01 inside the PNG data, patched a random byte and passed
+    against the broken decoder. A regression test that can find the wrong
+    thing is worse than none.
+    """
+    encoder = QRenEncoder()
+    # verify_integrity=False ON PURPOSE, and this is the crux of the test.
+    #
+    # Patching a type byte also invalidates the circle hash and merkle
+    # root, so with integrity on the archive is rejected by the hash check
+    # and the unknown-type path is never reached — the test would pass
+    # against the broken decoder for entirely the wrong reason.
+    #
+    # A genuine archive from a newer QRen carries CORRECT hashes and an
+    # unknown type. Turning integrity off is how a locally-forged block
+    # reproduces that shape. With it off, the pre-fix decoder returns
+    # valid=True, block_count=0, data=None, errors=[] — the defect, bare.
+    decoder = QRenDecoder(verify_integrity=False)
+
+    unused = next(c for c in range(0x01, 0xFF)
+                  if c not in {b.value for b in BlockType})
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        outpath = os.path.join(tmpdir, "unknown.qren.png")
+        encoder.encode(data={"payload": "must not vanish"}, name="unknown",
+                       block_type=BlockType.TREE, output_path=outpath)
+        with open(outpath, "rb") as fh:
+            blob = fh.read()
+
+        # Sanity: it decodes cleanly before we touch it.
+        clean = decoder.decode_bytes(blob)
+        assert clean['valid'], "fixture archive is not valid before patching"
+        assert clean['block_count'] == 1, "expected exactly one block"
+
+        block_id = bytes.fromhex(clean['blocks'][0]['block_id'])
+        idx = blob.find(block_id)
+        assert idx != -1, "could not locate the block frame by its block_id"
+        assert blob[idx + 32] == BlockType.TREE.value, \
+            "block_id found but the type byte is not where the layout says"
+
+        patched = bytearray(blob)
+        patched[idx + 32] = unused
+        decoded = decoder.decode_bytes(bytes(patched))
+
+        assert decoded['valid'] is False, (
+            "an archive with an unknown block type reported valid=True — "
+            "this is the silent data-loss regression"
+        )
+        assert decoded['validation_errors'], "no validation error was recorded"
+        assert any("unrecognised" in e.lower() or "unknown" in e.lower()
+                   for e in decoded['validation_errors']), \
+            f"error does not name the cause: {decoded['validation_errors']}"
+        assert decoded['block_count'] >= 1, (
+            "the unknown block was dropped entirely; an unknown type is not a "
+            "reason to lose bytes"
+        )
+
+
+def test_growth_space_still_stops_cleanly(r):
+    """The counterpart. Making unknown types loud must not make growth space
+    loud — trailing zeros are a normal, valid end of section."""
+    encoder = QRenEncoder()
+    decoder = QRenDecoder()
+    with tempfile.TemporaryDirectory() as tmpdir:
+        outpath = os.path.join(tmpdir, "growth.qren.png")
+        encoder.encode(data={"a": 1}, name="growth", output_path=outpath)
+        decoded = decoder.decode(outpath)
+        assert decoded['valid'], \
+            f"growth space was reported as an error: {decoded['validation_errors']}"
+        assert decoded['validation_errors'] == []
+        assert decoded['data'] is not None
+
 # ═══════════════════════════════════════════════════════════════
 # RUNNER
 # ═══════════════════════════════════════════════════════════════
@@ -491,6 +577,8 @@ def main():
         ("Large Data (~100KB)", test_large_data),
         ("MVQ Validation", test_mvq_validation),
         ("Empty Data", test_empty_data),
+        ("Unknown Block Type Is Not Silent", test_unknown_block_type_is_not_silent),
+        ("Growth Space Still Stops Cleanly", test_growth_space_still_stops_cleanly),
     ]
     
     print("=" * 72)
