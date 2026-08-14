@@ -6,7 +6,7 @@ Copyright (c) 2026 Shibbieness (Mark) · M MAOU LLC
 ## Authorship and affiliation
 
 Authored by Shibbieness with AI assistance (Claude). QRen Coder is an
-independent project and is not affiliated with or endorsed by Anthropic or
+independent project and is not affiliated with or endorsed by
 any AI vendor — the tooling is incidental, the way a compiler or an IDE is.
 
 Practical consequence: commits, files, and docs here carry the maintainer's
