@@ -78,3 +78,38 @@ None of this has been reviewed by an attorney. §7(b) additional terms and
 revenue-triggered contract obligations are both areas where homemade wording
 causes real problems. Have a lawyer review this and
 `LICENSE-COMMERCIAL.md` before enforcing either against anyone.
+
+---
+
+## Authorship inside this repository
+
+Distinct from everything above, which is about how *downstream users* credit
+this project. This section is about how commits here are attributed.
+
+**Author of record is Shibbieness.** The work is his, directed by him, and
+owned by M MAOU LLC.
+
+**AI co-authorship is credited by name, in the commit body:**
+
+```
+Built by Claude. Direction and ownership: Shibbieness · M MAOU LLC.
+```
+
+A plain sentence — not a `Co-Authored-By:` trailer, and no email address.
+
+**No vendor addresses. No links to chat sessions.** Both were present across
+this history and have been removed; `tools/leakguard.py --history` now checks
+for them, and a `commit-msg` hook refuses them before they land.
+
+### Why
+
+The model provider is a service that is paid for. It is not an employer, a
+partner, or a contributor. A `Co-Authored-By:` trailer carrying a company's
+address is a machine-readable assertion that the company contributed — git
+and GitHub both treat it that way — and no agreement supports that assertion.
+Attribution is not consideration, and a paid subscription does not purchase a
+byline on the subscriber's work.
+
+The credit to the assistant stays, because that part is true. What goes is
+the company address attached to it, which was never a statement about who
+wrote anything.
