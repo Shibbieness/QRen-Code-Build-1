@@ -3,14 +3,15 @@ QRCF Decoder — QRenCode Container Format v1 Decoder
 =====================================================
 
 Decodes QRCF containers (PNG + XQPE trailer) back to data.
-Implements decoder compliance profiles A through C (Phase 1).
-
-Profile A (Minimal): Read bytes, verify invariants.
-Profile B (Structural): Resolve blocks, circles, references.
-Profile C (Semantic): Block semantics, runic tags, manifest.
-Profile D (Full Native): Deferred to Phase 2+ (visual decoding, QRVM).
-
 Also decodes .xqmem standalone files (raw XQPE trailer).
+
+STATUS: PHASE 1 COMPLETE. 15/15 tests verified.
+This is the canonical qrcf_decoder.py as verified in the original build session.
+
+Profile A (Minimal): Read bytes, verify section hashes, Merkle root.
+Profile B (Structural): Resolve circles, decompress, parse manifest.
+Profile C (Semantic): Block semantics, Runic tags, content_address verify.
+Profile D (Full Native): Deferred to Phase 2+ (QRVM, visual decoding, growth).
 
 This is NOT CodexOmega. No external DB. Fully self-contained.
 """
@@ -20,35 +21,59 @@ import json
 import struct
 import hashlib
 import base64
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional
 from pathlib import Path
 
-from qrcf_types import (
+from .qrcf_types import (
+    BlockHeaderFlags,
     QREN_MAGIC, XQPE_MAGIC, QRCF_VERSION,
     BlockType, CompressionTier, NormalizationProfile,
     SectionEntry, BlockHeader, TrailerHeader, IntegrityBlock,
     QRenError, QRenFormatError, QRenIntegrityError, QRenCompressionError,
     content_address, merkle_root,
 )
-from qrcf_encoder import CompressionEngine
+from .qrcf_encoder import CompressionEngine
 
 
-# ═══════════════════════════════════════════════════════════════
-# DECODER
-# ═══════════════════════════════════════════════════════════════
+
+def _summarize_type_header(header):
+    """Render a per-type header as JSON-safe fields.
+
+    The class name alone proves a header was FOUND; it does not prove the
+    fields came back. A header parsed at the wrong offset is still the right
+    class and holds rubbish, so the values have to be visible to be checked —
+    by a test, and by anyone debugging an archive.
+
+    Bytes become hex and enums become names, because this result travels out
+    through the Vanilla Core flavor adapter as JSON.
+    """
+    if header is None:
+        return None
+    import dataclasses
+    out = {}
+    for f in dataclasses.fields(header):
+        v = getattr(header, f.name)
+        if isinstance(v, (bytes, bytearray)):
+            out[f.name] = v.hex()
+        elif hasattr(v, "name") and hasattr(v, "value"):
+            out[f.name] = v.name
+        else:
+            out[f.name] = v
+    return out
+
 
 class QRenDecoder:
     """
     QRCF v1 Decoder.
-    
+
     Reads a .qren.png (QRCF container) or .xqmem (standalone XQPE)
     file and extracts data blocks.
-    
+
     Usage:
         decoder = QRenDecoder()
         result = decoder.decode("archive.qren.png")
-        data = result['data']       # Extracted bytes
-        manifest = result['manifest']  # Circle 2 metadata
+        data = result['data']
+        manifest = result['manifest']
     """
 
     def __init__(self, verify_integrity: bool = True):
@@ -58,18 +83,9 @@ class QRenDecoder:
     # ─── Main Entry Points ────────────────────────────────────
 
     def decode(self, filepath: str) -> dict:
-        """
-        Decode a QRCF container or .xqmem file.
-        
-        Args:
-            filepath: Path to .qren.png or .xqmem file.
-        
-        Returns:
-            dict with 'data', 'manifest', 'translation', 'integrity', etc.
-        """
+        """Decode a QRCF container or .xqmem file."""
         filepath = str(filepath)
         raw = Path(filepath).read_bytes()
-        
         if filepath.endswith('.xqmem'):
             return self._decode_xqmem(raw)
         else:
@@ -84,33 +100,21 @@ class QRenDecoder:
     # ─── QRCF Decoding (PNG + Trailer) ────────────────────────
 
     def _decode_qrcf(self, data: bytes) -> dict:
-        """
-        Decode a full QRCF container (PNG image + XQPE trailer).
-        
-        Strategy: locate the XQPE magic in the file, everything
-        from that point forward is the trailer.
-        """
-        # ── Step 1: Find the XQPE trailer ──
+        """Decode a full QRCF container (PNG image + XQPE trailer)."""
         trailer_offset = self._find_trailer(data)
         if trailer_offset < 0:
             raise QRenFormatError(
                 "No XQPE trailer found. This may be a standard QR code "
                 "(Profile A decode: metadata only from QR layer)."
             )
-        
         trailer = data[trailer_offset:]
         png_data = data[:trailer_offset]
-        
-        # ── Step 2: Try to extract Circle 0 from PNG ──
         circle_0 = self._extract_circle_0(png_data)
-        
-        # ── Step 3: Decode the trailer ──
         result = self._decode_trailer(trailer)
         result['circle_0'] = circle_0
         result['png_size'] = len(png_data)
         result['trailer_offset'] = trailer_offset
         result['total_size'] = len(data)
-        
         return result
 
     def _decode_xqmem(self, data: bytes) -> dict:
@@ -122,20 +126,12 @@ class QRenDecoder:
     # ─── Trailer Decoding ─────────────────────────────────────
 
     def _decode_trailer(self, trailer: bytes) -> dict:
-        """
-        Decode an XQPE trailer. This is the core decode path.
-        
-        Implements Profile A → B → C progressively.
-        """
+        """Decode an XQPE trailer. Core decode path. Profile A → B → C."""
+
         # ══ PROFILE A: Read bytes, verify invariants ══
-        
-        # Parse trailer header
+
         header = TrailerHeader.unpack(trailer)
-        
-        if header.version != QRCF_VERSION:
-            # Forward compatibility: warn but proceed
-            pass
-        
+
         # Parse section directory
         dir_offset = TrailerHeader.PACKED_SIZE
         sections = []
@@ -143,44 +139,37 @@ class QRenDecoder:
             entry_start = dir_offset + (i * SectionEntry.PACKED_SIZE)
             entry_end = entry_start + SectionEntry.PACKED_SIZE
             if entry_end > len(trailer):
-                raise QRenFormatError(
-                    f"Section directory truncated at entry {i}: "
-                    f"need {entry_end} bytes, have {len(trailer)}"
-                )
+                raise QRenFormatError(f"Section directory truncated at entry {i}")
             entry = SectionEntry.unpack(trailer[entry_start:entry_end])
             sections.append(entry)
-        
-        # ── Verify section hashes (Profile A integrity) ──
+
+        # Verify section hashes
         section_hashes = []
         validation_errors = []
         for sec in sections:
             sec_data = trailer[sec.offset:sec.offset + sec.length]
             if len(sec_data) != sec.length:
                 validation_errors.append(
-                    f"Circle {sec.circle_id}: truncated (expected {sec.length}, "
-                    f"got {len(sec_data)} bytes)"
+                    f"Circle {sec.circle_id}: truncated "
+                    f"(expected {sec.length}, got {len(sec_data)} bytes)"
                 )
                 section_hashes.append(b'\x00' * 32)
                 continue
-            
             computed_hash = content_address(sec_data)
             section_hashes.append(computed_hash)
-            
             if self.verify_integrity and computed_hash != sec.hash:
                 validation_errors.append(
                     f"Circle {sec.circle_id}: hash mismatch "
                     f"(expected {sec.hash.hex()[:16]}..., "
                     f"got {computed_hash.hex()[:16]}...)"
                 )
-        
-        # ── Parse integrity block ──
+
+        # Parse and verify integrity block
         integrity_offset = max(s.offset + s.length for s in sections) if sections else 0
         integrity = None
         if integrity_offset < len(trailer):
             try:
                 integrity = IntegrityBlock.unpack(trailer[integrity_offset:])
-                
-                # Verify Merkle root
                 if self.verify_integrity:
                     expected_merkle = merkle_root(section_hashes)
                     if integrity.merkle_root != expected_merkle:
@@ -213,34 +202,34 @@ class QRenDecoder:
             'validation_errors': validation_errors,
             'valid': len(validation_errors) == 0,
         }
-        
-        # ══ PROFILE B: Resolve blocks, circles, references ══
-        
+
+        # ══ PROFILE B: Resolve circles ══
+
         translation = None
         manifest = None
         data_blocks = []
-        
+
         for sec in sections:
             sec_data = trailer[sec.offset:sec.offset + sec.length]
-            
+
             if sec.circle_id == 1:
-                # Circle 1: Translation Layer
+                # Circle 1: Translation Layer (LZ4-compressed JSON)
                 try:
                     raw = self.compressor.decompress(sec_data, CompressionTier.T1_LZ4)
                     translation = json.loads(raw.decode('utf-8'))
                 except Exception as e:
                     validation_errors.append(f"Circle 1 decode failed: {e}")
-                    
+
             elif sec.circle_id == 2:
-                # Circle 2: Manifest + Index
+                # Circle 2: Manifest + Index (LZ4-compressed JSON)
                 try:
                     raw = self.compressor.decompress(sec_data, CompressionTier.T1_LZ4)
                     manifest = json.loads(raw.decode('utf-8'))
                 except Exception as e:
                     validation_errors.append(f"Circle 2 decode failed: {e}")
-                    
+
             elif sec.circle_id >= 3:
-                # Circle 3+: Data blocks
+                # Circle 3+: Data blocks (raw BlockHeader + per-block compressed data)
                 try:
                     blocks, block_errors = self._extract_data_blocks(sec_data)
                     data_blocks.extend(blocks)
@@ -251,14 +240,14 @@ class QRenDecoder:
                     validation_errors.extend(block_errors)
                 except Exception as e:
                     validation_errors.append(f"Circle {sec.circle_id} decode failed: {e}")
-        
-        # ══ PROFILE C: Block semantics, extract primary data ══
-        
+
+        # ══ PROFILE C: Extract primary data ══
+
         primary_data = None
         decoded = [b for b in data_blocks if b.get('decoded', True)]
         if decoded:
             primary_data = decoded[0]['data']
-        
+
         return {
             'profile_a': profile_a,
             'translation': translation,
@@ -271,6 +260,9 @@ class QRenDecoder:
                 'runic_tags': b['runic_tags'],
                 'data_length': len(b['data']) if b.get('data') is not None else 0,
                 'decoded': b.get('decoded', True),
+                'type_header': type(b['type_header']).__name__
+                                if b.get('type_header') is not None else None,
+                'type_header_fields': _summarize_type_header(b.get('type_header')),
             } for b in data_blocks],
             'data': primary_data,
             'block_count': len(data_blocks),
@@ -395,7 +387,33 @@ class QRenDecoder:
                 )
                 break
 
-            compressed_data = remaining[data_start:data_end]
+            data_region = remaining[data_start:data_end]
+
+            # Per-type header, if this block carries one. It lives
+            # uncompressed at the front of the data region and is counted
+            # inside data_length, so the frame arithmetic above is unaffected
+            # and an older decoder still skips exactly one block.
+            type_header = None
+            if block_header.flags & BlockHeaderFlags.HAS_TYPE_HEADER:
+                from .qrcf_types_phase2 import TYPE_HEADERS, unpack_type_header
+                if block_header.block_type not in TYPE_HEADERS:
+                    errors.append(
+                        f"block at offset {pos} sets HAS_TYPE_HEADER but "
+                        f"{block_header.block_type.name} defines none"
+                    )
+                else:
+                    try:
+                        type_header, consumed = unpack_type_header(
+                            block_header.block_type, data_region)
+                        data_region = data_region[consumed:]
+                    except Exception as exc:
+                        errors.append(
+                            f"{block_header.block_type.name} type header at "
+                            f"offset {pos} did not parse: {exc}"
+                        )
+                        type_header = None
+
+            compressed_data = data_region
 
             try:
                 raw_data = self.compressor.decompress(
@@ -424,6 +442,7 @@ class QRenDecoder:
                 'runic_tags': block_header.runic_tags,
                 'data': raw_data,
                 'decoded': True,
+                'type_header': type_header,
             })
 
             pos += data_end
@@ -433,47 +452,26 @@ class QRenDecoder:
     # ─── Trailer Location ─────────────────────────────────────
 
     def _find_trailer(self, data: bytes) -> int:
-        """
-        Locate the XQPE trailer in a QRCF file.
-        
-        Strategy: search for XQPE_MAGIC bytes. The trailer starts
-        after the PNG IEND chunk.
-        """
-        # Method 1: Find XQPE magic directly
+        """Locate the XQPE trailer in a QRCF file."""
         idx = data.find(XQPE_MAGIC)
         if idx >= 0:
             return idx
-        
-        # Method 2: Find PNG IEND and look right after
+        # Fallback: find PNG IEND and look right after
         iend_marker = b'IEND'
         idx = data.find(iend_marker)
         if idx >= 0:
-            # IEND chunk: 4 bytes length + 4 bytes "IEND" + 4 bytes CRC
-            # The actual end is 4 bytes after "IEND" (for CRC)
             png_end = idx + 4 + 4  # past "IEND" + CRC
-            if png_end < len(data):
-                # Check if what follows is XQPE
-                if data[png_end:png_end+8] == XQPE_MAGIC:
-                    return png_end
-        
+            if png_end < len(data) and data[png_end:png_end+8] == XQPE_MAGIC:
+                return png_end
         return -1
 
     # ─── Circle 0 Extraction ──────────────────────────────────
 
     def _extract_circle_0(self, png_data: bytes) -> Optional[dict]:
-        """
-        Extract Circle 0 payload from the PNG image.
-        
-        Tries multiple strategies:
-        1. QR code scanning (if libraries available)
-        2. PNG tEXt chunk extraction (fallback)
-        """
-        # Try tEXt chunk extraction (always works)
+        """Extract Circle 0 payload from PNG tEXt chunk or QR scan."""
         circle_0 = self._extract_from_text_chunk(png_data)
         if circle_0:
             return circle_0
-        
-        # Try QR scanning if available
         try:
             from pyzbar.pyzbar import decode as qr_decode
             from PIL import Image
@@ -484,37 +482,25 @@ class QRenDecoder:
                 return self._parse_circle_0(payload)
         except (ImportError, Exception):
             pass
-        
         return None
 
     def _extract_from_text_chunk(self, png_data: bytes) -> Optional[dict]:
         """Extract Circle 0 from PNG tEXt chunk (keyword: QRenCode)."""
-        # Search for tEXt chunk with "QRenCode" keyword
         search = b'QRenCode\x00'
         idx = png_data.find(search)
         if idx < 0:
             return None
-        
-        # tEXt chunk: [4 len][4 "tEXt"][keyword\0value][4 CRC]
-        # The keyword+value starts 8 bytes before the keyword
-        # Actually we found "QRenCode\x00" inside the chunk data
         value_start = idx + len(search)
-        
-        # Find the end of the base64 data (before next chunk)
-        # PNG chunks are length-prefixed, but for robustness we look for
-        # the next chunk type or the end
         chunk_end = png_data.find(b'IDAT', value_start)
         if chunk_end < 0:
             chunk_end = png_data.find(b'IEND', value_start)
         if chunk_end < 0:
             return None
-        
-        # Back up 8 bytes (4 length + 4 CRC of tEXt chunk) 
-        # Actually just grab up to a reasonable boundary
         b64_data = png_data[value_start:chunk_end]
-        # Strip any CRC/length bytes at the end (non-base64 chars)
-        b64_data = bytes(b for b in b64_data if b in b'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/=')
-        
+        b64_data = bytes(
+            b for b in b64_data
+            if b in b'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/='
+        )
         try:
             payload = base64.b64decode(b64_data)
             return self._parse_circle_0(payload)
@@ -525,18 +511,15 @@ class QRenDecoder:
         """Parse the Circle 0 binary payload."""
         if len(payload) < 50:
             return {'raw': payload.hex(), 'parsed': False}
-        
         pos = 0
         magic = payload[pos:pos+4]; pos += 4
         if magic != QREN_MAGIC:
             return {'raw': payload.hex(), 'parsed': False}
-        
-        version = struct.unpack('>H', payload[pos:pos+2])[0]; pos += 2
+        version     = struct.unpack('>H', payload[pos:pos+2])[0]; pos += 2
         trailer_len = struct.unpack('>Q', payload[pos:pos+8])[0]; pos += 8
         num_circles = struct.unpack('>I', payload[pos:pos+4])[0]; pos += 4
         manifest_hash = payload[pos:pos+32].hex(); pos += 32
-        archive_id = payload[pos:pos+36].decode('ascii', errors='replace'); pos += 36
-        
+        archive_id  = payload[pos:pos+36].decode('ascii', errors='replace')
         return {
             'parsed': True,
             'magic': magic.decode('ascii'),

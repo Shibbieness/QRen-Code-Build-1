@@ -1,0 +1,290 @@
+"""
+Block type classifier — vendored from qren-type-system's
+build/tools/block_type_classifier_baseline.py ("Skill #1" of its 17-skill
+operational catalog: block-type-classifier-v1, paired with Skill #16's
+auto-detection-ruleset as its inline deterministic core).
+
+This is the deterministic baseline an SLM would augment for cases it
+returns uncertain=True on — no SLM is wired here, this is the rule-based
+floor by itself, which is fully functional on its own.
+
+CASL floor enforced (all four asserted by self_test() below):
+  1. Never silently rewrite content (input is read; never modified)
+  2. Return uncertain explicitly when ambiguous
+  3. Respect explicit declaration in metadata when present
+  4. Identical inputs produce identical outputs (rule-based; deterministic)
+
+Adapted from the vendored original: BLOCK_TYPES here is derived from
+qren.block_types (this repo's single registry) rather than a duplicated
+dict, so the classifier and the rest of qren/ can never drift apart on
+what the 15 type codes are.
+"""
+from __future__ import annotations
+
+import hashlib
+import json
+import re
+from dataclasses import dataclass, field, asdict
+from typing import Optional, Union
+
+from qren.block_types import ALL_TYPES
+
+BLOCK_TYPES = {bt.hex_code: bt.name for bt in ALL_TYPES}
+
+# =============================================================================
+# Auto-detection ruleset (Skill #16)
+# =============================================================================
+
+# Extension-based rules (highest priority after explicit declaration).
+EXTENSION_RULES: dict[str, tuple[str, str, float]] = {
+    # (extension): (type_code, reasoning, confidence)
+    ".py":      ("0x01", "Python source code: living hierarchy",                                  0.92),
+    ".js":      ("0x01", "JavaScript source code: living hierarchy",                              0.92),
+    ".ts":      ("0x01", "TypeScript source code: living hierarchy",                              0.92),
+    ".rs":      ("0x01", "Rust source code: living hierarchy",                                    0.92),
+    ".go":      ("0x01", "Go source code: living hierarchy",                                      0.92),
+    ".c":       ("0x01", "C source code: living hierarchy",                                       0.92),
+    ".cpp":     ("0x01", "C++ source code: living hierarchy",                                     0.92),
+    ".java":    ("0x01", "Java source code: living hierarchy",                                    0.92),
+    ".rb":      ("0x01", "Ruby source code: living hierarchy",                                    0.92),
+    ".md":      ("0x01", "Markdown document: living hierarchy",                                   0.85),
+    ".json":    ("0x06", "JSON: structured navigation",                                           0.90),
+    ".yaml":    ("0x06", "YAML: structured navigation",                                           0.90),
+    ".yml":     ("0x06", "YAML: structured navigation",                                           0.90),
+    ".toml":    ("0x06", "TOML: structured navigation",                                           0.90),
+    ".csv":     ("0x06", "CSV: structured tabular",                                               0.92),
+    ".lock":    ("0x02", "Lock file: sealed identity",                                            0.93),
+    ".lockb":   ("0x02", "Bun lock file: sealed identity",                                        0.93),
+    ".bin":     ("0x04", "Binary artifact: AOT-compiled / fast path",                             0.85),
+    ".so":      ("0x04", "Shared object: AOT-compiled binary",                                    0.92),
+    ".dll":     ("0x04", "Dynamic library: AOT-compiled binary",                                  0.92),
+    ".dylib":   ("0x04", "Dynamic library (macOS): AOT-compiled binary",                          0.92),
+    ".exe":     ("0x04", "Executable binary: AOT-compiled",                                       0.92),
+    ".pyc":     ("0x04", "Python bytecode: AOT-compiled",                                         0.90),
+    ".sh":      ("0x03", "Shell script: executable runtime instruction",                          0.88),
+    ".bash":    ("0x03", "Bash script: executable runtime instruction",                           0.88),
+    ".qrcf":    ("0xFF", "QRen Canonical Format: declared by metadata, fallback",                 0.50),
+    ".skill":   ("0x08", "PseudoSkill capsule: NESTED composition",                                0.90),
+}
+
+# Content-sniff rules (when extension is absent or generic).
+CONTENT_SNIFF_RULES: list[tuple[re.Pattern, str, str, float]] = [
+    (re.compile(rb"^\s*(def |class |import |from \w+ import)", re.MULTILINE), "0x01", "Python code: living hierarchy", 0.88),
+    (re.compile(rb"^\s*(function |const |let |var |import|export)", re.MULTILINE), "0x01", "JS/TS code: living hierarchy", 0.85),
+    (re.compile(rb"# This file is automatically @generated by"), "0x02", "Auto-generated lock content: sealed", 0.90),
+    (re.compile(rb'"lockfileVersion":'), "0x02", "package-lock signature: sealed", 0.93),
+    (re.compile(rb"^\s*[\{\[]"), "0x06", "JSON-shaped: structured navigation", 0.75),
+    (re.compile(rb"^---\s*\n"), "0x06", "YAML frontmatter: structured navigation", 0.80),
+    (re.compile(rb"^#!/.*?(sh|bash|zsh)"), "0x03", "Shebang script: executable", 0.92),
+    (re.compile(rb"^---\n.*?lattice_version", re.DOTALL), "0x01", "Lattice WEAVE document: living hierarchy", 0.88),
+    # U+16A0..U+16FF (Runic) as explicit UTF-8 sequences.
+    #
+    # This was written "[ᚠ-᛿]".encode("utf-8"), which looks like a codepoint
+    # range and is not one: encoding the string yields the BYTE class
+    # [\xe1\x9a\xa0-\xe1\x9b\xbf], and a bytes-regex reads that as "any byte
+    # in 0xA0-0xE1, plus 0x9A, 0x9B, 0xBF". That is the UTF-8 lead byte of
+    # nearly every non-ASCII script, so 'café', 'Grüße', 'ΑΒΓ' and any
+    # Japanese text all matched — classified RUNIC at 0.85 with
+    # uncertain=False, which is a wrong answer stated confidently rather than
+    # a missed one.
+    #
+    # A character range only survives .encode() when every endpoint is one
+    # byte. These are three.
+    (re.compile(rb"\xe1\x9a[\xa0-\xbf]|\xe1\x9b[\x80-\xbf]"), "0x09", "Runic glyphs present: symbolic script", 0.85),
+    (re.compile("ᚨ○|ᛟ○".encode("utf-8")), "0x09", "AiCircle/admathCircle present: RUNIC", 0.95),
+    (re.compile(rb"NESTED\[arc_id="), "0x08", "Explicit NESTED composition", 0.95),
+    (re.compile(rb"\[block:\s*glyph\]"), "0x09", "WEAVE glyph block: Runic", 0.92),
+    (re.compile(rb"\[block:\s*code\]"), "0x01", "WEAVE code block: living hierarchy", 0.85),
+    (re.compile(rb"\[block:\s*note\]"), "0x0E", "WEAVE note block: commentary", 0.85),
+]
+
+
+@dataclass
+class ClassificationResult:
+    type_code: Optional[str]
+    type_name: Optional[str]
+    confidence: float
+    reasoning: str
+    uncertain: bool
+    echoed_content_hash: str
+    declaration_respected: bool = False
+    rule_fired: Optional[str] = None
+    candidates: list[str] = field(default_factory=list)
+
+    def to_dict(self) -> dict:
+        return asdict(self)
+
+    def to_json(self) -> str:
+        return json.dumps(self.to_dict(), indent=2)
+
+
+def _normalize_content(content: Union[bytes, str]) -> bytes:
+    if isinstance(content, str):
+        return content.encode("utf-8")
+    return content
+
+
+def _content_hash(content: bytes) -> str:
+    """SHA-256 of content. The classifier echoes this to prove it didn't modify input."""
+    return hashlib.sha256(content).hexdigest()
+
+
+def _check_explicit_declaration(metadata: Optional[dict]) -> Optional[tuple[str, str]]:
+    """CASL floor: explicit declaration always wins over inference."""
+    if not metadata:
+        return None
+    declared = metadata.get("declared_type")
+    if declared:
+        raw = declared.strip()
+        code = "0x" + raw[2:].upper() if raw.lower().startswith("0x") else "0x" + raw.upper()
+        if code in BLOCK_TYPES:
+            return code, BLOCK_TYPES[code]
+    return None
+
+
+def _extension_rule(filename: Optional[str]) -> Optional[tuple[str, str, float, str]]:
+    if not filename:
+        return None
+    fn_lower = filename.lower()
+    matched = None
+    for ext, info in EXTENSION_RULES.items():
+        if fn_lower.endswith(ext):
+            if matched is None or len(ext) > len(matched[3]):
+                code, reason, conf = info
+                matched = (code, reason, conf, ext)
+    if matched:
+        return (matched[0], matched[1], matched[2], f"extension:{matched[3].lstrip('.')}")
+    return None
+
+
+def _content_sniff(content: bytes) -> list[tuple[str, str, float, str]]:
+    matches = []
+    head = content[:8192]  # only first 8KB
+    for pattern, code, reason, conf in CONTENT_SNIFF_RULES:
+        if pattern.search(head):
+            matches.append((code, reason, conf, f"content-sniff:{pattern.pattern[:30]!r}"))
+    return matches
+
+
+def classify(
+    content: Union[bytes, str],
+    filename: Optional[str] = None,
+    metadata: Optional[dict] = None,
+) -> ClassificationResult:
+    """
+    Classify content into a QRen block type.
+
+    CASL floor invariants:
+        1. Content is read but never modified. echoed_content_hash proves it.
+        2. Genuinely ambiguous cases return uncertain=True with candidates.
+        3. Explicit declaration in metadata always wins.
+        4. Identical inputs produce identical outputs (rule-based; deterministic).
+    """
+    content_bytes = _normalize_content(content)
+    echoed_hash = _content_hash(content_bytes)
+
+    declared = _check_explicit_declaration(metadata)
+    if declared:
+        code, name = declared
+        return ClassificationResult(
+            type_code=code, type_name=name, confidence=1.0,
+            reasoning=f"Explicit declaration in metadata: {code} {name}",
+            uncertain=False, echoed_content_hash=echoed_hash,
+            declaration_respected=True, rule_fired="explicit-declaration",
+        )
+
+    ext_match = _extension_rule(filename)
+    sniff_matches = _content_sniff(content_bytes)
+
+    all_candidates: list[tuple[str, str, float, str]] = []
+    if ext_match:
+        all_candidates.append(ext_match)
+    all_candidates.extend(sniff_matches)
+
+    if not all_candidates:
+        return ClassificationResult(
+            type_code=None, type_name=None, confidence=0.0,
+            reasoning="No detection rule matched. Content provides no classifiable signal.",
+            uncertain=True, echoed_content_hash=echoed_hash, rule_fired=None, candidates=[],
+        )
+
+    all_candidates.sort(key=lambda x: (-x[2], -len(x[3])))
+    top_code, top_reason, top_conf, top_rule = all_candidates[0]
+
+    distinct_codes = list({c[0] for c in all_candidates if c[2] >= 0.80})
+    if len(distinct_codes) >= 2 and top_conf < 0.90:
+        return ClassificationResult(
+            type_code=None, type_name=None, confidence=top_conf,
+            reasoning=(f"Multiple candidate types matched with similar confidence: {distinct_codes}. "
+                       f"Top candidate ({top_code}) reasoning: {top_reason}. Returning uncertain per CASL floor."),
+            uncertain=True, echoed_content_hash=echoed_hash, rule_fired=top_rule, candidates=distinct_codes,
+        )
+
+    if top_conf < 0.80:
+        return ClassificationResult(
+            type_code=top_code, type_name=BLOCK_TYPES[top_code], confidence=top_conf,
+            reasoning=f"Low-confidence inference: {top_reason}. ML augmentation recommended.",
+            uncertain=True, echoed_content_hash=echoed_hash, rule_fired=top_rule,
+            candidates=distinct_codes if len(distinct_codes) >= 2 else [top_code],
+        )
+
+    return ClassificationResult(
+        type_code=top_code, type_name=BLOCK_TYPES[top_code], confidence=top_conf,
+        reasoning=top_reason, uncertain=False, echoed_content_hash=echoed_hash, rule_fired=top_rule,
+    )
+
+
+def self_test():
+    """The four CASL floor invariants, asserted directly."""
+    content = b"def hello(): pass"
+    result = classify(content=content, filename="test.py")
+    expected_hash = hashlib.sha256(content).hexdigest()
+    assert result.echoed_content_hash == expected_hash, "CASL VIOLATION: content hash changed"
+
+    inp = (b"some ambiguous content", "test.unknown")
+    results = [classify(content=inp[0], filename=inp[1]) for _ in range(10)]
+    for r in results[1:]:
+        assert r.type_code == results[0].type_code, "CASL VIOLATION: retry produced different classification"
+        assert r.uncertain == results[0].uncertain
+
+    result = classify(content=b"this looks like nothing in particular", filename="test.unknown",
+                       metadata={"declared_type": "0x0B"})
+    assert result.type_code == "0x0B", "CASL VIOLATION: explicit declaration not honored"
+    assert result.declaration_respected is True
+
+    result = classify(content=b'{"x": 1}', filename=None)
+    assert result.uncertain is True, "CASL VIOLATION: ambiguous content did not return uncertain"
+
+    result = classify(content=b"\x00\x01\x02\x03", filename=None)
+    assert result.uncertain is True, "CASL VIOLATION: no-signal content did not return uncertain"
+
+    print("All CASL floor tests passed.")
+
+
+if __name__ == "__main__":
+    import sys
+
+    if len(sys.argv) >= 2 and sys.argv[1] == "--self-test":
+        self_test()
+        sys.exit(0)
+
+    if len(sys.argv) >= 2 and sys.argv[1] == "--demo":
+        examples = [
+            (b"def hello(): pass", "hello.py"),
+            (b'{"key": "value"}', "config.json"),
+            (b"#!/bin/bash\necho hello", "script.sh"),
+            (b"some content with no signal", None),
+            ("magic circle: ᚨ○ ( q ᛟ○ t ᛟ○0 ) ᚨ○0".encode("utf-8"), None),
+            (b"---\nlattice_version: v1u0p0\n---\n# Document", "doc.md"),
+            (b"NESTED[arc_id=5] { ... }", "spec.txt"),
+            (b"\x00\x01\x02\x03", None),
+        ]
+        for content, filename in examples:
+            result = classify(content=content, filename=filename)
+            print(f"\n--- Input: filename={filename!r}, content={content[:50]!r}... ---")
+            print(result.to_json())
+        sys.exit(0)
+
+    print("Usage:")
+    print("  python3 -m qren.classifier --self-test")
+    print("  python3 -m qren.classifier --demo")

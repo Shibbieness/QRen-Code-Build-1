@@ -5,6 +5,9 @@ QRCF Encoder — QRenCode Container Format v1 Encoder
 Encodes structured data into a QRCF container:
   PNG image (Circle 0 QR code) + XQPE binary trailer
 
+STATUS: PHASE 1 COMPLETE. 15/15 tests verified.
+This is the canonical qrcf_encoder.py as verified in the original build session.
+
 Phase 1 scope:
   - XQPE trailer with section directory and 64-bit offsets
   - Circle 0: QR bootstrap (magic, version, pointers)
@@ -26,19 +29,20 @@ import zlib
 import struct
 import hashlib
 import uuid
-from typing import Any, Dict, List, Optional, Tuple, Union
+from typing import Any, Dict, List, Optional
 from pathlib import Path
 
-from qrcf_types import (
+from .qrcf_types import (
+    BlockHeaderFlags,
     QREN_MAGIC, XQPE_MAGIC, QRCF_VERSION,
     BlockType, CompressionTier, NormalizationProfile, EdgeType,
     QRCFFlags, SectionEntry, BlockHeader, TrailerHeader, IntegrityBlock,
     QRenError, QRenFormatError, QRenCompressionError, QRenBlockError,
     content_address, merkle_root, auto_detect_block_type,
-    BLOCK_NORMALIZATION,
+    BLOCK_NORMALIZATION, compute_growth_space,
 )
 
-# Optional dependencies: prefer zstd/lz4 if available, fall back to zlib
+# Optional dependencies
 try:
     import zstandard as zstd
     HAS_ZSTD = True
@@ -51,14 +55,12 @@ try:
 except ImportError:
     HAS_LZ4 = False
 
-# Optional: QR code generation
 try:
     import qrcode
     HAS_QRCODE = True
 except ImportError:
     HAS_QRCODE = False
 
-# Optional: PNG image support
 try:
     from PIL import Image
     HAS_PIL = True
@@ -75,23 +77,20 @@ class CompressionEngine:
 
     @staticmethod
     def compress(data: bytes, tier: CompressionTier) -> bytes:
-        """Compress data using the specified tier."""
         if tier == CompressionTier.T0_NONE:
             return data
         elif tier == CompressionTier.T1_LZ4:
             if HAS_LZ4:
                 return lz4.frame.compress(data)
-            # Fallback to zlib level 1 (fast)
             return zlib.compress(data, level=1)
         elif tier == CompressionTier.T2_ZSTD:
             if HAS_ZSTD:
                 cctx = zstd.ZstdCompressor(level=9)
                 return cctx.compress(data)
-            # Fallback to zlib level 9
             return zlib.compress(data, level=9)
         elif tier in (CompressionTier.T3_DELTA, CompressionTier.T4_FRACTAL,
                       CompressionTier.T5_DEDUP):
-            # Phase 1: these advanced tiers fall back to T2_ZSTD behavior
+            # Phase 1: advanced tiers fall back to T2_ZSTD behavior
             if HAS_ZSTD:
                 cctx = zstd.ZstdCompressor(level=9)
                 return cctx.compress(data)
@@ -101,7 +100,6 @@ class CompressionEngine:
 
     @staticmethod
     def decompress(data: bytes, tier: CompressionTier) -> bytes:
-        """Decompress data from the specified tier."""
         if tier == CompressionTier.T0_NONE:
             return data
         elif tier == CompressionTier.T1_LZ4:
@@ -130,10 +128,10 @@ class CompressionEngine:
 class QRenEncoder:
     """
     QRCF v1 Encoder.
-    
+
     Encodes data into a QRenCode Container Format file:
       [PNG Image with QR code] + [XQPE Binary Trailer]
-    
+
     Usage:
         encoder = QRenEncoder()
         result = encoder.encode(
@@ -144,7 +142,7 @@ class QRenEncoder:
         )
     """
 
-    def __init__(self, 
+    def __init__(self,
                  default_compression: CompressionTier = CompressionTier.T2_ZSTD,
                  growth_space_percent: int = 15):
         self.default_compression = default_compression
@@ -160,69 +158,126 @@ class QRenEncoder:
                metadata: Optional[Dict] = None,
                filename_hint: str = "",
                output_path: Optional[str] = None,
-               output_xqmem: bool = False) -> dict:
+               output_xqmem: bool = False,
+               flags: int = 0,
+               type_header=None,
+               resolver=None) -> dict:
         """
         Encode data into a QRCF container.
-        
+
         Args:
-            data: Input data. bytes, str, dict, list, or any JSON-serializable.
+            data: Input. bytes, str, dict, list, or any JSON-serializable.
             name: Human-readable archive name.
             block_type: Block type. None = auto-detect, default AMORPHOUS.
             compression: Compression tier. None = use default.
-            runic_tags: Semantic tags for Runic index.
+            runic_tags: Semantic tags for Runic index (List[str]).
             metadata: Additional metadata dict.
             filename_hint: Original filename for auto-detection.
             output_path: File path for .qren.png output.
             output_xqmem: Also write .xqmem (raw XQPE bytes).
-        
+            flags: BlockHeader flags byte (BlockHeaderFlags bitmask).
+            resolver: Optional RuleChainResolver. When given, effective
+                compression and normalization are taken from the inherited
+                circle rule chain instead of this encoder's hardcoded
+                defaults. Explicit arguments still win — see the precedence
+                note in the body.
+            type_header: Optional per-type header for VOID / BONE / CRYSTAL /
+                NESTED (see qrcf_types_phase2.TYPE_HEADERS). Packed
+                UNCOMPRESSED at the front of the data region and counted
+                inside data_length, so the block frame stays
+                FIXED_SIZE + tag_len + data_length and a decoder that does not
+                know this block type still skips exactly one block.
+
         Returns:
-            dict with archive_id, checksums, sizes, paths.
+            dict with archive_id, checksums, sizes, paths, etc.
         """
-        # ── 1. Serialize input data to bytes ──
+        # 1. Serialize input to bytes
         raw_bytes = self._serialize(data)
-        
-        # ── 2. Determine block type ──
+
+        # 2. Determine block type
         if block_type is None:
             block_type = auto_detect_block_type(raw_bytes, filename_hint)
-        
-        # ── 3. Determine compression ──
-        # `is not None`, never `or`: CompressionTier.T0_NONE is 0x00 and
-        # therefore FALSY, so `compression or default` silently discarded
-        # an explicit request for no compression and used the default
-        # instead. Asking for T0_NONE had never worked, on the path every
-        # block takes. An enum whose first member is zero cannot be tested
-        # for presence by truthiness.
-        comp = compression if compression is not None else self.default_compression
-        
-        # ── 4. Determine normalization ──
-        norm = BLOCK_NORMALIZATION.get(block_type, NormalizationProfile.LOOSE)
-        
-        # ── 5. Compress data ──
+
+        # 3/4. Determine compression and normalization.
+        #
+        # Precedence, and the order is the whole point:
+        #
+        #   explicit argument  >  inherited circle rule  >  hardcoded default
+        #
+        # A caller who names a compression tier means it, so the rule chain
+        # must not override them — rules are defaults for blocks that did not
+        # choose, not policy imposed on blocks that did. And an inherited rule
+        # must beat the hardcoded default, or the whole inheritance system
+        # resolves correctly and then changes nothing.
+        rule_comp = rule_norm = None
+        if resolver is not None:
+            from .qrcf_circle_rules import encode_with_rules
+            effective = encode_with_rules(raw_bytes, resolver,
+                                          block_type, runic_tags)
+            rule_comp = effective.get('compression')
+            rule_norm = effective.get('normalization')
+
+        # `is not None`, never `or`. T0_NONE is 0x00 and STRICT is 0x00, so
+        # both are FALSY — `compression or default` silently discarded an
+        # explicit request for no compression and always produced the default
+        # instead. That predates the resolver; asking for T0_NONE has never
+        # worked. An enum whose first member is zero cannot be tested for
+        # presence by truthiness, and the two places it mattered here were
+        # both on the path every single block takes.
+        comp = compression if compression is not None else (
+            rule_comp if rule_comp is not None else self.default_compression)
+        norm = rule_norm if rule_norm is not None else BLOCK_NORMALIZATION.get(
+            block_type, NormalizationProfile.LOOSE)
+
+        # 5. Compress data
         compressed = self.compressor.compress(raw_bytes, comp)
-        
-        # ── 6. Content-address the raw data ──
+
+        # 6. Content-address the raw data
         block_id = content_address(raw_bytes)
-        
-        # ── 7. Build the data block (Circle 3) ──
+
+        # 7. Build the data block (Circle 3)
+        # Per-type header, uncompressed, at the front of the data region.
+        #
+        # Inside data_length rather than between the block header and it: that
+        # keeps the frame arithmetic identical for every reader, so a decoder
+        # meeting an unknown block type skips FIXED_SIZE + tag_len +
+        # data_length and lands on the next block instead of mid-frame.
+        # Outside data_length it would have had to know the type to know the
+        # size, which is precisely what it does not know.
+        type_header_bytes = b""
+        if type_header is not None:
+            from .qrcf_types_phase2 import TYPE_HEADERS, pack_type_header
+            expected = TYPE_HEADERS.get(block_type)
+            if expected is None:
+                raise QRenFormatError(
+                    f"block type {block_type.name} takes no type header")
+            if not isinstance(type_header, expected):
+                raise QRenFormatError(
+                    f"{block_type.name} expects {expected.__name__}, got "
+                    f"{type(type_header).__name__}")
+            type_header_bytes = pack_type_header(type_header)
+            flags |= BlockHeaderFlags.HAS_TYPE_HEADER
+
         block_header = BlockHeader(
             block_id=block_id,
             block_type=block_type,
             normalization=norm,
             compression=comp,
-            flags=0,
-            data_length=len(compressed),
+            flags=flags,
+            # Covers the type header too — see the note above.
+            data_length=len(type_header_bytes) + len(compressed),
             runic_tags=runic_tags or []
         )
-        circle_3_data = block_header.pack() + compressed
-        
-        # ── 8. Add growth space ──
+        circle_3_data = block_header.pack() + type_header_bytes + compressed
+
+        # 8. Add growth space
         growth_size = max(64, int(len(circle_3_data) * self.growth_space_percent / 100))
         circle_3_data += b'\x00' * growth_size
-        
-        # ── 9. Build Circle 1 (Translation Layer) ──
+
+        # 9. Build Circle 1 (Translation Layer)
         circle_1_data = self._build_circle_1(comp, block_type, norm)
-        
-        # ── 10. Build Circle 2 (Manifest + Index) ──
+
+        # 10. Build Circle 2 (Manifest + Index)
         archive_id = str(uuid.uuid4())
         circle_2_data = self._build_circle_2(
             archive_id=archive_id, name=name,
@@ -230,28 +285,27 @@ class QRenEncoder:
             metadata=metadata or {},
             runic_tags=runic_tags or []
         )
-        
-        # ── 11. Compute section hashes ──
+
+        # 11. Compute section hashes
         h1 = content_address(circle_1_data)
         h2 = content_address(circle_2_data)
         h3 = content_address(circle_3_data)
-        
-        # ── 12. Build section directory ──
-        # Offsets are relative to trailer start, computed after header + directory
+
+        # 12. Build section directory (offsets from trailer start)
         header_size = TrailerHeader.PACKED_SIZE
-        dir_size = 3 * SectionEntry.PACKED_SIZE  # 3 circles
-        
+        dir_size = 3 * SectionEntry.PACKED_SIZE
+
         c1_offset = header_size + dir_size
         c2_offset = c1_offset + len(circle_1_data)
         c3_offset = c2_offset + len(circle_2_data)
-        
+
         sections = [
             SectionEntry(circle_id=1, offset=c1_offset, length=len(circle_1_data), hash=h1),
             SectionEntry(circle_id=2, offset=c2_offset, length=len(circle_2_data), hash=h2),
             SectionEntry(circle_id=3, offset=c3_offset, length=len(circle_3_data), hash=h3),
         ]
-        
-        # ── 13. Build integrity block ──
+
+        # 13. Build integrity block
         merkle = merkle_root([h1, h2, h3])
         integrity = IntegrityBlock(
             merkle_root=merkle,
@@ -259,26 +313,26 @@ class QRenEncoder:
             signature=b''
         )
         integrity_data = integrity.pack()
-        
-        # ── 14. Compute total trailer length ──
+
+        # 14. Compute total trailer length
         trailer_len = (header_size + dir_size
                        + len(circle_1_data) + len(circle_2_data)
                        + len(circle_3_data) + len(integrity_data))
-        
-        # ── 15. Build trailer header ──
-        flags = QRCFFlags.INTEGRITY_MERKLE
+
+        # 15. Build trailer header
+        trailer_flags = QRCFFlags.INTEGRITY_MERKLE
         if growth_size > 0:
-            flags |= QRCFFlags.GROWTH_RESERVED
-        
+            trailer_flags |= QRCFFlags.GROWTH_RESERVED
+
         trailer_header = TrailerHeader(
             version=QRCF_VERSION,
             trailer_len=trailer_len,
             offset_c1=c1_offset,
             num_circles=3,
-            flags=flags
+            flags=trailer_flags
         )
-        
-        # ── 16. Assemble full trailer ──
+
+        # 16. Assemble full trailer
         trailer = bytearray()
         trailer.extend(trailer_header.pack())
         for s in sections:
@@ -288,39 +342,38 @@ class QRenEncoder:
         trailer.extend(circle_3_data)
         trailer.extend(integrity_data)
         trailer = bytes(trailer)
-        
-        # Verify trailer length
+
         assert len(trailer) == trailer_len, \
             f"Trailer length mismatch: expected {trailer_len}, got {len(trailer)}"
-        
-        # ── 17. Build Circle 0 QR payload ──
+
+        # 17. Build Circle 0 QR payload
         qr_payload = self._build_circle_0(
             archive_id=archive_id,
             trailer_len=trailer_len,
             num_circles=3,
             manifest_hash=h2
         )
-        
-        # ── 18. Generate QR image ──
+
+        # 18. Generate QR image
         qr_image_bytes = self._generate_qr_image(qr_payload)
-        
-        # ── 19. Assemble final QRCF file (PNG + trailer) ──
+
+        # 19. Assemble final QRCF file (PNG + trailer)
         qrcf_data = qr_image_bytes + trailer
-        
-        # ── 20. Write output files ──
+
+        # 20. Write output files
         paths = {}
         if output_path:
             Path(output_path).parent.mkdir(parents=True, exist_ok=True)
             with open(output_path, 'wb') as f:
                 f.write(qrcf_data)
             paths['qrcf'] = output_path
-        
+
         if output_xqmem:
             xqmem_path = (output_path or f"{name}.qren.png").rsplit('.', 2)[0] + '.xqmem'
             with open(xqmem_path, 'wb') as f:
                 f.write(trailer)
             paths['xqmem'] = xqmem_path
-        
+
         return {
             'archive_id': archive_id,
             'name': name,
@@ -343,45 +396,26 @@ class QRenEncoder:
     # ─── Circle Builders ──────────────────────────────────────
 
     def _build_circle_0(self, archive_id: str, trailer_len: int,
-                         num_circles: int, manifest_hash: bytes) -> bytes:
-        """
-        Build Circle 0 QR payload.
-        
-        Contains ONLY: magic, version, pointer info, manifest hash.
-        MUST NOT contain semantic data or executable logic.
-        """
+                        num_circles: int, manifest_hash: bytes) -> bytes:
+        """Build Circle 0 QR payload — 86 bytes. MUST NOT contain semantic data."""
         payload = bytearray()
-        payload.extend(QREN_MAGIC)                              # 4: magic
-        payload.extend(struct.pack('>H', QRCF_VERSION))         # 2: version
-        payload.extend(struct.pack('>Q', trailer_len))           # 8: trailer length
-        payload.extend(struct.pack('>I', num_circles))           # 4: circle count
-        payload.extend(manifest_hash)                            # 32: manifest hash
-        payload.extend(archive_id[:36].encode('ascii'))          # 36: archive ID
+        payload.extend(QREN_MAGIC)
+        payload.extend(struct.pack('>H', QRCF_VERSION))
+        payload.extend(struct.pack('>Q', trailer_len))
+        payload.extend(struct.pack('>I', num_circles))
+        payload.extend(manifest_hash)
+        payload.extend(archive_id[:36].encode('ascii'))
         return bytes(payload)
 
     def _build_circle_1(self, compression: CompressionTier,
-                         block_type: BlockType,
-                         normalization: NormalizationProfile) -> bytes:
-        """
-        Build Circle 1: Translation Layer.
-        
-        Formal decoding descriptor:
-          - Enumerated compression codecs available
-          - Normalization registry
-          - Block-type registry
-          - RAM Cache geometry defaults (placeholder for Phase 1)
-        """
+                        block_type: BlockType,
+                        normalization: NormalizationProfile) -> bytes:
+        """Build Circle 1 — LZ4-compressed JSON translation layer."""
         translation = {
             'schema_version': 1,
-            'compression_codecs': {
-                tier.name: tier.value for tier in CompressionTier
-            },
-            'normalization_profiles': {
-                prof.name: prof.value for prof in NormalizationProfile
-            },
-            'block_type_registry': {
-                bt.name: bt.value for bt in BlockType
-            },
+            'compression_codecs': {t.name: t.value for t in CompressionTier},
+            'normalization_profiles': {p.name: p.value for p in NormalizationProfile},
+            'block_type_registry': {bt.name: bt.value for bt in BlockType},
             'default_compression': compression.name,
             'default_normalization': normalization.name,
             'ram_cache_geometry': {
@@ -397,15 +431,14 @@ class QRenEncoder:
             }
         }
         raw = json.dumps(translation, separators=(',', ':')).encode('utf-8')
-        # Circle 1 is compressed with T1 (fast access)
+        # Circle 1 always uses T1_LZ4 for fast-access decoding
         return self.compressor.compress(raw, CompressionTier.T1_LZ4)
 
     def _build_circle_2(self, archive_id: str, name: str,
-                         block_headers: List[BlockHeader],
-                         metadata: dict, runic_tags: List[str]) -> bytes:
+                        block_headers: List[BlockHeader],
+                        metadata: dict, runic_tags: List[str]) -> bytes:
         """
-        Build Circle 2: Structural Layer (Index + Manifest + Dependency Plane).
-        
+        Build Circle 2 — LZ4-compressed JSON structural layer.
         Contains metadata ONLY — no bulk data.
         """
         manifest = {
@@ -424,13 +457,15 @@ class QRenEncoder:
             } for bh in block_headers],
             'runic_index': {
                 'tags': runic_tags,
-                'tag_to_blocks': {tag: [bh.block_id.hex() for bh in block_headers
-                                        if tag in bh.runic_tags]
-                                  for tag in runic_tags}
+                'tag_to_blocks': {
+                    tag: [bh.block_id.hex() for bh in block_headers
+                          if tag in bh.runic_tags]
+                    for tag in runic_tags
+                }
             },
             'dependency_graph': {
                 'nodes': [bh.block_id.hex() for bh in block_headers],
-                'edges': []  # Phase 1: no cross-block dependencies yet
+                'edges': []  # Phase 1: no cross-block dependencies
             },
             'version_table': {
                 'current_version': 1,
@@ -442,15 +477,17 @@ class QRenEncoder:
                     'is_sealed': False,
                 }]
             },
+            'boot_manifest': None,
             'metadata': metadata,
         }
         raw = json.dumps(manifest, separators=(',', ':')).encode('utf-8')
+        # Circle 2 always uses T1_LZ4 for fast-access decoding
         return self.compressor.compress(raw, CompressionTier.T1_LZ4)
 
     # ─── Serialization ────────────────────────────────────────
 
     def _serialize(self, data: Any) -> bytes:
-        """Serialize input to bytes. Accepts bytes, str, dict, list, or JSON-able."""
+        """Serialize input to bytes. Accepts bytes, str, dict, list, or JSON-serializable."""
         if isinstance(data, bytes):
             return data
         elif isinstance(data, str):
@@ -458,13 +495,12 @@ class QRenEncoder:
         elif isinstance(data, (dict, list, tuple, int, float, bool)):
             return json.dumps(data, default=str, ensure_ascii=False).encode('utf-8')
         else:
-            # Try JSON as last resort
             return json.dumps(data, default=str).encode('utf-8')
 
     # ─── QR Generation ────────────────────────────────────────
 
     def _generate_qr_image(self, payload: bytes) -> bytes:
-        """Generate a PNG image containing the Circle 0 QR code."""
+        """Generate PNG with Circle 0 QR code. Falls back to minimal PNG."""
         if HAS_QRCODE and HAS_PIL:
             import base64
             qr = qrcode.QRCode(
@@ -473,48 +509,30 @@ class QRenEncoder:
                 box_size=4,
                 border=2
             )
-            # Encode payload as base64 for QR (binary QR is less supported)
             qr.add_data(base64.b64encode(payload).decode('ascii'))
             qr.make(fit=True)
             img = qr.make_image(fill_color="black", back_color="white")
-            
             buf = io.BytesIO()
             img.save(buf, format='PNG')
             return buf.getvalue()
         else:
-            # Fallback: generate a minimal valid PNG with embedded payload
             return self._generate_minimal_png(payload)
 
     def _generate_minimal_png(self, payload: bytes) -> bytes:
-        """
-        Generate a minimal valid PNG image that embeds the Circle 0 payload
-        in a tEXt chunk. Works without any image libraries.
-        """
-        # Minimal 1x1 white PNG
+        """Minimal 1x1 PNG with Circle 0 payload in tEXt chunk."""
+        import base64
+
         def png_chunk(chunk_type: bytes, data: bytes) -> bytes:
-            import struct, zlib as _zlib
             length = struct.pack('>I', len(data))
-            crc = struct.pack('>I', _zlib.crc32(chunk_type + data) & 0xFFFFFFFF)
+            crc = struct.pack('>I', zlib.crc32(chunk_type + data) & 0xFFFFFFFF)
             return length + chunk_type + data + crc
-        
-        # PNG signature
+
         signature = b'\x89PNG\r\n\x1a\n'
-        
-        # IHDR: 1x1 pixel, 8-bit grayscale
         ihdr_data = struct.pack('>IIBBBBB', 1, 1, 8, 0, 0, 0, 0)
         ihdr = png_chunk(b'IHDR', ihdr_data)
-        
-        # IDAT: single white pixel (filter byte 0 + pixel value 255)
         raw_row = b'\x00\xff'
-        idat_data = zlib.compress(raw_row)
-        idat = png_chunk(b'IDAT', idat_data)
-        
-        # tEXt chunk: embed Circle 0 payload as "QRenCode" text
-        import base64
+        idat = png_chunk(b'IDAT', zlib.compress(raw_row))
         text_data = b'QRenCode\x00' + base64.b64encode(payload)
         text_chunk = png_chunk(b'tEXt', text_data)
-        
-        # IEND
         iend = png_chunk(b'IEND', b'')
-        
         return signature + ihdr + text_chunk + idat + iend

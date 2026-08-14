@@ -10,7 +10,17 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
-      - name: QRCF format suite
-        run: python test_phase1.py
+
+      # The QRCF suites use their own runner rather than unittest, so they are
+      # invoked as modules. `python -m unittest qren.qrcf.test_phase1` would
+      # collect zero tests and exit 0 — a green CI step that ran nothing.
+      - name: QRCF Phase 1 suite
+        run: python -m qren.qrcf.test_phase1
+      - name: QRCF Phase 2 suite
+        run: python -m qren.qrcf.test_phase2
+
       - name: Vanilla Core flavor adapter suite
         run: python -m unittest test_flavor -v
+
+      - name: Classifier CASL floor
+        run: python -c "from qren.classifier import self_test; self_test()"

@@ -1,6 +1,11 @@
 [flavor]
 name = "qren-coder"
-version = "1.0.0-phase1"
+version = "1.1.0"
 license = "AGPL-3.0-or-later"
 entrypoint = "vanilla_flavor:run"
-capabilities = ["encode", "decode", "verify", "block-types", "self-test"]
+capabilities = [
+  # QRCF container format
+  "encode", "decode", "verify", "block-types", "self-test",
+  # semantic layer
+  "classify", "slime-phase", "tokens", "circle",
+]
